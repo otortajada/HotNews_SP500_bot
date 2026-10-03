@@ -1,24 +1,10 @@
 import os
-import time
-import threading
 import requests
 import feedparser
-from flask import Flask
 
-# Servidor Web mínimo para mantener Render despierto
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "🤖 Bot de Alertas de Trading activo y escaneando 24/7."
-
-# ==========================================
-# CONFIGURACIÓN VÍA VARIABLES DE ENTORNO
-# ==========================================
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "TU_TOKEN_AQUI")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "TU_CHAT_ID_AQUI")
-
-CHECK_INTERVAL = 300  # 5 minutos
+# Configuración mediante Secrets de GitHub
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 RSS_FEEDS = [
     "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&dateb=&owner=include&count=40&output=atom",
@@ -32,9 +18,11 @@ SP500_TICKERS = [
     "COST", "PEP", "KO", "ADBE", "WMT", "MCD", "CSCO", "CRM", "ACN", "BAC"
 ]
 
-noticias_procesadas = set()
-
 def enviar_telegram(mensaje):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Error: No se han configurado las credenciales de Telegram.")
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -44,10 +32,11 @@ def enviar_telegram(mensaje):
     try:
         requests.post(url, data=payload, timeout=10)
     except Exception as e:
-        print(f"Error enviando mensaje: {e}")
+        print(f"Error enviando mensaje a Telegram: {e}")
 
 def revisar_feeds():
     headers = {'User-Agent': 'MiSistemaAlertasTrading miemail@ejemplo.com'}
+    alertas_enviadas = 0
 
     for feed_url in RSS_FEEDS:
         try:
@@ -55,11 +44,6 @@ def revisar_feeds():
             feed = feedparser.parse(response.content)
 
             for entry in feed.entries:
-                noticia_id = entry.get('id', entry.get('link', entry.get('title')))
-                
-                if noticia_id in noticias_procesadas:
-                    continue
-
                 titulo = entry.get('title', '')
                 link = entry.get('link', '')
 
@@ -72,23 +56,14 @@ def revisar_feeds():
                         )
                         enviar_telegram(mensaje)
                         print(f"Notificación enviada para {ticker}")
+                        alertas_enviadas += 1
                         break
-
-                noticias_procesadas.add(noticia_id)
 
         except Exception as e:
             print(f"Error procesando feed {feed_url}: {e}")
 
-def bucle_bot():
-    print("🤖 Bot iniciado correctamente...")
-    enviar_telegram("🤖 *Bot de Alertas Activado en Render (24/7)*")
-    while True:
-        revisar_feeds()
-        time.sleep(CHECK_INTERVAL)
-
-# Arrancar el bucle del bot en segundo plano
-threading.Thread(target=bucle_bot, daemon=True).start()
+    if alertas_enviadas == 0:
+        print("Escaneo completado sin nuevas alertas coincidentes.")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    revisar_feeds()
