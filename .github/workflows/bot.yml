@@ -3,7 +3,7 @@ name: Bot Alertas Bolsa
 on:
   schedule:
     - cron: '*/5 * * * *'
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 jobs:
   run-bot:
