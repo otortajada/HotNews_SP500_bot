@@ -1,4 +1,4 @@
-name: Bot Alertas Bolsa
+name: Bot Alertas Bolsa test
 
 on: workflow_dispatch
 
