@@ -1,8 +1,6 @@
 name: Bot Alertas Bolsa
 
-on: [schedule, workflow_dispatch]
-
-
+on: [workflow_dispatch]
 
 jobs:
   run-bot:
