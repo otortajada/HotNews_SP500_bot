@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import feedparser
@@ -17,12 +18,14 @@ ENVIAR_PRUEBA = os.environ.get("ENVIAR_PRUEBA", "").lower() == "true"
 
 FEED_URL = (
     "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K"
-    "&company=&dateb=&owner=include&count=100&output=atom"
+    "&company=&dateb=&owner=include&count={count}&start={start}&output=atom"
 )
+POR_PAGINA = 100  # máximo que admite el SEC
+PAGINAS = 5       # hasta 500 filings hacia atrás (cubre varias horas)
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SP500_FILE = Path("sp500.txt")
 SEEN_FILE = Path("seen.json")
-MAX_SEEN = 3000
+MAX_SEEN = 5000
 
 # Puntos del 8-K que te interesan. Si lo dejas vacío (set()), recibes todos.
 ITEMS_RELEVANTES = {
@@ -92,6 +95,39 @@ def guardar_vistos(vistos):
     SEEN_FILE.write_text(json.dumps(vistos[-MAX_SEEN:]), encoding="utf-8")
 
 
+def id_filing(entrada):
+    m = ACC_RE.search(entrada.get("id", ""))
+    return m.group(1) if m else entrada.get("link", "")
+
+
+def descargar_entradas(headers, vistos_set, primera_vez):
+    """Lee páginas del feed del SEC hasta llegar a filings ya vistos."""
+    entradas = []
+    for pagina in range(PAGINAS):
+        url = FEED_URL.format(count=POR_PAGINA, start=pagina * POR_PAGINA)
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            r.raise_for_status()
+        except requests.RequestException as e:
+            if pagina == 0:
+                sys.exit(f"No se pudo leer el feed del SEC: {e}")
+            print(f"Aviso: falló la página {pagina + 1} del feed ({e}); sigo con lo leído.")
+            break
+
+        de_pagina = feedparser.parse(r.content).entries
+        if not de_pagina:
+            if pagina == 0:
+                sys.exit("El feed del SEC no devolvió entradas.")
+            break
+
+        entradas.extend(de_pagina)
+        # Si toda la página ya se conocía, no hace falta ir más atrás
+        if not primera_vez and all(id_filing(e) in vistos_set for e in de_pagina):
+            break
+        time.sleep(0.3)  # el SEC limita las peticiones por segundo
+    return entradas
+
+
 def main():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         sys.exit("Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID.")
@@ -106,22 +142,18 @@ def main():
     sp500 = cargar_sp500()
     mapa_cik = cargar_mapa_cik(headers)
 
-    r = requests.get(FEED_URL, headers=headers, timeout=30)
-    r.raise_for_status()
-    entradas = feedparser.parse(r.content).entries
-    if not entradas:
-        sys.exit("El feed del SEC no devolvió entradas.")
-
     vistos = cargar_vistos()
     primera_vez = vistos is None
     vistos = vistos or []
     vistos_set = set(vistos)
     enviadas = 0
 
+    entradas = descargar_entradas(headers, vistos_set, primera_vez)
+    print(f"Filings leídos del feed: {len(entradas)}.")
+
     # De la más antigua a la más reciente, para que lleguen en orden
     for e in reversed(entradas):
-        m_acc = ACC_RE.search(e.get("id", ""))
-        acc = m_acc.group(1) if m_acc else e.get("link", "")
+        acc = id_filing(e)
         if not acc or acc in vistos_set:
             continue
 
