@@ -4,6 +4,8 @@ import os
 import re
 import sys
 import time
+from html.parser import HTMLParser
+from urllib.parse import urljoin
 from pathlib import Path
 
 import feedparser
@@ -26,6 +28,8 @@ TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SP500_FILE = Path("sp500.txt")
 SEEN_FILE = Path("seen.json")
 MAX_SEEN = 5000
+INCLUIR_EXTRACTO = True   # añade un extracto en inglés del filing al aviso
+EXTRACTO_MAX = 500        # caracteres por extracto
 
 # Puntos del 8-K que te interesan. Si lo dejas vacío (set()), recibes todos.
 ITEMS_RELEVANTES = {
@@ -69,12 +73,14 @@ class FeedNoDisponible(Exception):
     """El SEC no responde tras varios intentos (fallo temporal)."""
 
 
-def get_con_reintentos(url, headers, intentos=3, timeout=(10, 45)):
+def get_con_reintentos(url, headers, intentos=3, timeout=(10, 45), exit_en_403=True):
     ultimo = None
     for n in range(1, intentos + 1):
         try:
             r = requests.get(url, headers=headers, timeout=timeout)
             if r.status_code == 403:
+                if not exit_en_403:
+                    raise FeedNoDisponible("403 Forbidden")
                 # Esto no es temporal: el SEC rechaza el User-Agent
                 sys.exit("El SEC devolvió 403: revisa SEC_USER_AGENT (nombre y email reales).")
             r.raise_for_status()
@@ -113,6 +119,141 @@ def cargar_vistos():
 
 def guardar_vistos(vistos):
     SEEN_FILE.write_text(json.dumps(vistos[-MAX_SEEN:]), encoding="utf-8")
+
+
+BLOQUES_HTML = {"p", "div", "br", "tr", "li", "table", "h1", "h2", "h3", "h4", "h5", "h6"}
+
+
+class _ExtractorTexto(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.partes = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in BLOQUES_HTML:
+            self.partes.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in BLOQUES_HTML:
+            self.partes.append("\n")
+        elif tag in ("td", "th"):
+            self.partes.append(" ")
+
+    def handle_data(self, data):
+        self.partes.append(data)
+
+
+def html_a_texto(crudo):
+    crudo = re.sub(r"(?is)<ix:header>.*?</ix:header>", " ", crudo)  # metadatos XBRL ocultos
+    crudo = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", crudo)
+    p = _ExtractorTexto()
+    p.feed(crudo)
+    p.close()
+    texto = "".join(p.partes).replace("\xa0", " ")
+    lineas = [re.sub(r"[ \t\r\f\v]+", " ", l).strip() for l in texto.split("\n")]
+    return "\n".join(l for l in lineas if l)
+
+
+def recortar(texto, maximo):
+    texto = re.sub(r"\s+", " ", texto).strip()
+    if len(texto) <= maximo:
+        return texto
+    corte = texto[:maximo]
+    punto = max(corte.rfind(". "), corte.rfind("; "))
+    if punto > maximo * 0.5:
+        return corte[: punto + 1]
+    return corte.rsplit(" ", 1)[0] + "…"
+
+
+def extraer_seccion(texto, item):
+    """Texto del punto del 8-K (p. ej. 1.01), sin el título."""
+    m = re.search(rf"(?im)^\s*Item\s+{re.escape(item)}(?!\d)[\s.:\-–—]*", texto)
+    if not m:
+        return ""
+    resto = texto[m.end():]
+    fin = re.search(r"(?im)^\s*(Item\s+\d\.\d{2}(?!\d)|SIGNATURES?\b)", resto)
+    if fin:
+        resto = resto[: fin.start()]
+    lineas = [l for l in resto.split("\n") if l.strip()]
+    if len(lineas) > 1 and len(lineas[0]) < 100:
+        lineas = lineas[1:]  # era el título del punto
+    return " ".join(lineas)
+
+
+def extracto_comunicado(texto):
+    """Titular y primeros párrafos de un comunicado (Exhibit 99.1)."""
+    return " ".join(l for l in texto.split("\n") if len(l) >= 40)
+
+
+def descargar_texto(url, headers):
+    r = get_con_reintentos(url, headers, intentos=2, timeout=(10, 30), exit_en_403=False)
+    try:
+        crudo = r.content.decode("utf-8")
+    except UnicodeDecodeError:
+        crudo = r.content.decode("cp1252", errors="replace")
+    return html_a_texto(crudo[:3_000_000])
+
+
+def documentos_filing(url_indice, headers):
+    """Devuelve (url del 8-K, url del comunicado EX-99) a partir de la página índice."""
+    r = get_con_reintentos(url_indice, headers, intentos=2, timeout=(10, 30), exit_en_403=False)
+    principal = exhibit = None
+    for fila in re.findall(r"(?is)<tr[^>]*>(.*?)</tr>", r.text):
+        celdas = re.findall(r"(?is)<td[^>]*>(.*?)</td>", fila)
+        if len(celdas) < 4:
+            continue
+        href = re.search(r'(?i)href="([^"]+)"', celdas[2])
+        if not href:
+            continue
+        tipo = re.sub(r"<[^>]+>", "", celdas[3]).strip().upper()
+        url = href.group(1)
+        if "doc=" in url:  # visor XBRL: /ix?doc=/Archives/...
+            url = url.split("doc=", 1)[1].split("&")[0]
+        url = urljoin("https://www.sec.gov", url)
+        if tipo.startswith("8-K") and not principal:
+            principal = url
+        elif tipo.startswith("EX-99") and not exhibit:
+            exhibit = url
+    return principal, exhibit
+
+
+def construir_extractos(entrada, items, headers):
+    """{punto: extracto en inglés}. Si algo falla, devuelve lo que haya (o nada)."""
+    extractos = {}
+    try:
+        principal, exhibit = documentos_filing(entrada.get("link", ""), headers)
+        texto = descargar_texto(principal, headers) if principal else ""
+        for i in items:
+            seccion = extraer_seccion(texto, i)
+            if seccion:
+                extractos[i] = recortar(seccion, EXTRACTO_MAX)
+
+        # Los resultados (2.02) solo remiten a un comunicado: lo bueno está en el Exhibit 99
+        if exhibit and ("2.02" in items or not extractos):
+            time.sleep(0.2)
+            comunicado = recortar(
+                extracto_comunicado(descargar_texto(exhibit, headers)), EXTRACTO_MAX
+            )
+            if comunicado:
+                extractos["2.02" if "2.02" in items else items[0]] = comunicado
+    except Exception as e:  # el extracto nunca debe impedir el aviso
+        print(f"No se pudo extraer el texto del filing: {e}")
+    return extractos
+
+
+def armar_mensaje(ticker, nombre, motivos, extractos, link):
+    bloques = []
+    for i in motivos:
+        bloque = f"• {i}: {html.escape(ITEMS_RELEVANTES.get(i, 'Otro'))}"
+        if i in extractos:
+            bloque += f"\n<i>{html.escape(extractos[i])}</i>"
+        bloques.append(bloque)
+    return (
+        f"🚨 <b>8-K · {html.escape(ticker)}</b>\n"
+        f"{html.escape(nombre)}\n\n"
+        + "\n\n".join(bloques)
+        + f'\n\n🔗 <a href="{html.escape(link, quote=True)}">Ver en el SEC</a>'
+    )
 
 
 def id_filing(entrada):
@@ -194,15 +335,13 @@ def main():
             continue
         motivos = relevantes if ITEMS_RELEVANTES else sorted(items)
 
-        lineas = "\n".join(
-            f"• {i}: {html.escape(ITEMS_RELEVANTES.get(i, 'Otro'))}" for i in motivos
-        )
-        mensaje = (
-            f"🚨 <b>8-K · {html.escape(candidatos[0])}</b>\n"
-            f"{html.escape(m['name'])}\n\n"
-            f"{lineas}\n\n"
-            f'🔗 <a href="{html.escape(e.get("link", ""), quote=True)}">Ver en el SEC</a>'
-        )
+        extractos = {}
+        if INCLUIR_EXTRACTO:
+            extractos = construir_extractos(e, motivos[:3], headers)
+        link = e.get("link", "")
+        mensaje = armar_mensaje(candidatos[0], m["name"], motivos, extractos, link)
+        if len(mensaje) > 4000:  # límite de Telegram: 4096
+            mensaje = armar_mensaje(candidatos[0], m["name"], motivos, {}, link)
         if enviar_telegram(mensaje):
             enviadas += 1
         else:
