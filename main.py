@@ -39,7 +39,6 @@ ITEMS_RELEVANTES = {
     "4.01": "Cambio de auditor",
     "4.02": "Cuentas no fiables (reformulación)",
     "5.01": "Cambio de control",
-    "5.02": "Cambios en directivos / consejo",
 }
 
 TITLE_RE = re.compile(r"^(?P<form>\S+)\s+-\s+(?P<name>.+?)\s+\((?P<cik>\d{10})\)")
