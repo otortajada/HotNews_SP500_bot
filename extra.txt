@@ -1,0 +1,4 @@
+# Empresas adicionales que quieres vigilar (además del S&P 500).
+# Un ticker por línea. Puedes añadir comentarios después de #.
+WOLF   # Wolfspeed
+ALEC   # Alector
