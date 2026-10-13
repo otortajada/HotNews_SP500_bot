@@ -31,6 +31,7 @@ PAGINAS = 5       # hasta 500 filings hacia atrás (cubre varias horas)
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SP500_FILE = Path("sp500.txt")
 EXTRA_FILE = Path("extra.txt")  # tus empresas adicionales (opcional)
+FEEDS_EXTRA_FILE = Path("feeds_extra.txt")  # listados RSS de notas de prensa adicionales (opcional)
 SEEN_FILE = Path("seen.json")
 MAX_SEEN = 5000
 INCLUIR_EXTRACTO = True   # añade un extracto en inglés del filing al aviso
@@ -52,6 +53,35 @@ NOTICIAS_UA = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 BOLSAS_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
+# --- Avisos con la nota de prensa (antes de que salga el 8-K) ---
+AVISAR_CON_NOTA = True    # vigila las webs de notas de prensa además del SEC
+FEEDS_NOTAS = [
+    ("PR Newswire", "https://www.prnewswire.com/rss/news-releases-list.rss"),
+    ("GlobeNewswire",
+     "https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire%20-%20News%20about%20Public%20Companies"),
+]
+# Qué notas merecen aviso (se mira solo el titular). Se puede editar libremente.
+CATEGORIAS_NOTA = {
+    "Resultados financieros": re.compile(
+        r"\b(results|earnings|quarter(?:ly)?|fiscal (?:year|20\d\d)|full[- ]year|Q[1-4])\b", re.I),
+    "Adquisición / fusión": re.compile(
+        r"\b(acquire[sd]?|acquiring|acquisition|merger|merge[sd]?|takeover|buyout|"
+        r"to be acquired|divest\w*|spin-?off)\b", re.I),
+    "Acuerdo material": re.compile(
+        r"\b(definitive agreement|licen[cs](?:e|ing) agreement|collaboration agreement|"
+        r"supply agreement|strategic agreement|enters? into (?:an? )?agreement)\b", re.I),
+    "Previsiones": re.compile(
+        r"\b(raises?|lowers?|cuts?|updates?|reaffirms?|withdraws?|initiates?)\b.{0,40}"
+        r"\b(guidance|outlook|forecast)\b", re.I),
+    "Quiebra": re.compile(r"\b(chapter 11|bankruptcy)\b", re.I),
+    "Regulatorio / ensayos": re.compile(r"\b(FDA|topline|phase [123])\b", re.I),
+}
+# Anuncios de fechas, llamadas, conferencias… no son la noticia
+EXCLUIR_NOTA_RE = re.compile(
+    r"\b(to (?:report|announce|release|host|hold|present|participate|attend)|"
+    r"will (?:report|announce|release|host|hold|present|participate)|schedules?|"
+    r"date of|conference call|webcast|investor (?:day|conference)|fireside|upcoming)\b", re.I)
+NOMBRES_SEC = {}  # ticker -> nombre de la empresa (se rellena al cargar el mapa del SEC)
 DATELINE_RE = re.compile(
     r"/PRNewswire[^/]*/|\(GLOBE ?NEWSWIRE\)|\(BUSINESS WIRE\)|/BUSINESS WIRE/", re.I
 )
@@ -75,7 +105,8 @@ ITEM_RE = re.compile(r"Item\s+(\d\.\d{2})")
 ACC_RE = re.compile(r"accession-number=([\d-]+)")
 
 
-def enviar_telegram(mensaje):
+def enviar_telegram(mensaje, responder_a=None):
+    """Devuelve el id del mensaje enviado (o True si no se pudo leer) y False si falla."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -83,12 +114,18 @@ def enviar_telegram(mensaje):
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
+    if responder_a:
+        payload["reply_to_message_id"] = responder_a
+        payload["allow_sending_without_reply"] = True
     try:
         r = requests.post(url, data=payload, timeout=15)
         if r.status_code != 200:
             print(f"Telegram devolvió {r.status_code}: {r.text}")
             return False
-        return True
+        try:
+            return r.json()["result"]["message_id"]
+        except Exception:
+            return True
     except requests.RequestException as e:
         print(f"Error enviando a Telegram: {e}")
         return False
@@ -130,23 +167,55 @@ def cargar_lista(ruta):
     return tickers
 
 
+def cargar_feeds_extra():
+    """Listados RSS adicionales de feeds_extra.txt, una línea 'Nombre | URL' por cada uno."""
+    feeds = []
+    if not FEEDS_EXTRA_FILE.exists():
+        return feeds
+    for linea in FEEDS_EXTRA_FILE.read_text(encoding="utf-8").splitlines():
+        linea = linea.strip()
+        if not linea or linea.startswith("#") or "|" not in linea:
+            continue
+        nombre, url = (x.strip() for x in linea.split("|", 1))
+        if url.startswith("http"):
+            feeds.append((nombre, url))
+    return feeds
+
+
 def cargar_mapa_cik(headers):
     r = get_con_reintentos(TICKERS_URL, headers)
     mapa = {}
     for v in r.json().values():
         cik = str(v["cik_str"]).zfill(10)
         mapa.setdefault(cik, []).append(v["ticker"].upper())
+        NOMBRES_SEC[v["ticker"].upper()] = v.get("title", "")
     return mapa
 
 
-def cargar_vistos():
-    if SEEN_FILE.exists():
-        return json.loads(SEEN_FILE.read_text(encoding="utf-8"))
-    return None  # None = primera ejecución
+def cargar_estado():
+    """Estado guardado entre ejecuciones. None si es la primera vez."""
+    if not SEEN_FILE.exists():
+        return None
+    try:
+        datos = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
+    except ValueError:
+        return None
+    if isinstance(datos, list):  # formato antiguo: solo la lista de filings vistos
+        datos = {"filings": datos}
+    return datos
 
 
-def guardar_vistos(vistos):
-    SEEN_FILE.write_text(json.dumps(vistos[-MAX_SEEN:]), encoding="utf-8")
+def _reciente(iso, horas, ahora=None):
+    ahora = ahora or datetime.now(timezone.utc)
+    return ahora - datetime.fromisoformat(iso) <= timedelta(hours=horas)
+
+
+def guardar_estado(estado):
+    estado["filings"] = estado["filings"][-MAX_SEEN:]
+    estado["notas"] = estado["notas"][-MAX_SEEN:]
+    for clave in ("avisos", "recientes"):  # solo interesan las últimas 72 horas
+        estado[clave] = {t: v for t, v in estado[clave].items() if _reciente(v["hora"], 72)}
+    SEEN_FILE.write_text(json.dumps(estado), encoding="utf-8")
 
 
 BLOQUES_HTML = {"p", "div", "br", "tr", "li", "table", "h1", "h2", "h3", "h4", "h5", "h6"}
@@ -661,8 +730,23 @@ def enlace_webull(ticker, bolsas):
     return f"https://www.webull.com/quote/{bolsa}-{ticker.lower()}"
 
 
+def _pie(cuerpo, mencionados, precios, enlaces):
+    """Parte común de todos los avisos: otras empresas, cotización y enlaces."""
+    if mencionados:
+        partes = [
+            f'<a href="{html.escape(u, quote=True)}">{html.escape(t)}</a>' if u else html.escape(t)
+            for t, u in mencionados
+        ]
+        cuerpo += "\n\n👀 También menciona: " + " · ".join(partes)
+    if precios:
+        cuerpo += "\n\n📊 <b>Cotización (IEX, hora de Madrid)</b>\n" + "\n".join(
+            html.escape(l) for l in precios)
+    return cuerpo + "\n\n" + "\n".join(enlaces)
+
+
 def armar_mensaje(ticker, nombre, motivos, extractos, link, noticia=None, webull=None,
-                  mencionados=(), precios=()):
+                  mencionados=(), precios=(), etiqueta=""):
+    """Aviso disparado por un 8-K."""
     con_resumen_noticia = bool(noticia and noticia.get("resumen"))
     bloques = []
     for i in motivos:
@@ -674,17 +758,6 @@ def armar_mensaje(ticker, nombre, motivos, extractos, link, noticia=None, webull
     if con_resumen_noticia:
         cuerpo = "\n".join(bloques) + f"\n\n<i>{html.escape(noticia['resumen'])}</i>"
 
-    if mencionados:
-        partes = [
-            f'<a href="{html.escape(u, quote=True)}">{html.escape(t)}</a>' if u else html.escape(t)
-            for t, u in mencionados
-        ]
-        cuerpo += "\n\n👀 También menciona: " + " · ".join(partes)
-
-    if precios:
-        cuerpo += "\n\n📊 <b>Cotización (IEX, hora de Madrid)</b>\n" + "\n".join(
-            html.escape(l) for l in precios)
-
     enlaces = []
     if noticia:
         enlaces.append(
@@ -695,11 +768,287 @@ def armar_mensaje(ticker, nombre, motivos, extractos, link, noticia=None, webull
     if webull:
         enlaces.append(f'📈 <a href="{html.escape(webull, quote=True)}">Cotización en Webull</a>')
 
+    cabecera = f"🚨 <b>8-K · {html.escape(ticker)}</b>\n{html.escape(nombre)}\n"
+    if etiqueta:
+        cabecera += f"{html.escape(etiqueta)}\n"
+    return cabecera + "\n" + _pie(cuerpo, mencionados, precios, enlaces)
+
+
+def armar_mensaje_nota(ticker, nombre, categoria, etiqueta, resumen, nota_link, fuente,
+                       link_8k=None, webull=None, mencionados=(), precios=()):
+    """Aviso disparado por una nota de prensa."""
+    cuerpo = f"• {html.escape(categoria)}"
+    if resumen:
+        cuerpo += f"\n<i>{html.escape(resumen)}</i>"
+    enlaces = [f'📰 <a href="{html.escape(nota_link, quote=True)}">Noticia ({html.escape(fuente)})</a>']
+    if link_8k:
+        enlaces.append(f'🔗 <a href="{html.escape(link_8k, quote=True)}">Comunicado SEC</a>')
+    if webull:
+        enlaces.append(f'📈 <a href="{html.escape(webull, quote=True)}">Cotización en Webull</a>')
+    cabecera = (f"🚨 <b>Nota de prensa · {html.escape(ticker)}</b>\n{html.escape(nombre)}\n"
+                f"{html.escape(etiqueta)}\n")
+    return cabecera + "\n" + _pie(cuerpo, mencionados, precios, enlaces)
+
+
+def armar_seguimiento_8k(ticker, nombre, motivos, extractos, link):
+    """Respuesta corta cuando llega el 8-K de una noticia que ya se avisó con la nota."""
+    bloques = []
+    for i in motivos:
+        bloque = f"• {i}: {html.escape(ITEMS_RELEVANTES.get(i, 'Otro'))}"
+        if i in extractos:
+            bloque += f"\n<i>{html.escape(recortar(extractos[i], 300))}</i>"
+        bloques.append(bloque)
     return (
-        f"🚨 <b>8-K · {html.escape(ticker)}</b>\n"
-        f"{html.escape(nombre)}\n\n"
-        f"{cuerpo}\n\n" + "\n".join(enlaces)
+        f"📄 <b>8-K publicado · {html.escape(ticker)}</b>\n{html.escape(nombre)}\n"
+        f"🏷 Nota de prensa + 8-K\n\n" + "\n\n".join(bloques)
+        + f'\n\n🔗 <a href="{html.escape(link, quote=True)}">Comunicado SEC</a>'
     )
+
+
+def quitar_html(texto):
+    return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", texto or "")).split())
+
+
+def categoria_nota(titular):
+    """Categoría de la noticia según su titular, o None si no merece aviso."""
+    if EXCLUIR_NOTA_RE.search(titular):
+        return None
+    for nombre, patron in CATEGORIAS_NOTA.items():
+        if patron.search(titular):
+            return nombre
+    return None
+
+
+def vigilados_en_nota(entrada, vigilados, claves_nombre):
+    """({ticker: bolsa} citados como '(Nasdaq: X)', [tickers que solo coinciden por el nombre])."""
+    titular = entrada.get("title", "")
+    etiquetas = " | ".join(
+        t.get("term", "") for t in (entrada.get("tags") or []) if isinstance(t, dict))
+    texto = f"{titular} | {quitar_html(entrada.get('summary', ''))} | {etiquetas}"
+    con_patron = {}
+    for bolsa, t in MENCION_RE.findall(texto):
+        t = t.replace(".", "-")
+        if t in vigilados:
+            con_patron.setdefault(t, bolsa.lower())
+    minus = titular.lower()
+    por_nombre = [
+        t for t, clave in claves_nombre.items()
+        if t not in con_patron and (minus.startswith(clave + " ") or minus.startswith(clave + ","))
+    ]
+    return con_patron, por_nombre
+
+
+def extras_aviso(ctx, ticker, mencionados, hora_nota):
+    """(enlace Webull, [(otra empresa, enlace)], [líneas de cotización]) de un aviso."""
+    if (ENLACE_WEBULL or mencionados) and ctx["bolsas"] is None:
+        ctx["bolsas"] = cargar_bolsas(ctx["headers"])
+    bolsas = ctx["bolsas"] or {}
+    webull = enlace_webull(ticker, bolsas) if ENLACE_WEBULL else None
+
+    otras = []
+    for t, bolsa_texto in list(mencionados.items())[:4]:
+        url = enlace_webull(t, bolsas) if ENLACE_WEBULL else None
+        if not url and ENLACE_WEBULL and bolsa_texto in ("nasdaq", "nyse"):
+            url = f"https://www.webull.com/quote/{bolsa_texto}-{t.lower()}"
+        otras.append((t, url))
+    if otras:
+        print("  también menciona: " + ", ".join(t for t, _ in otras))
+
+    precios = []
+    if USAR_ALPACA:
+        lista = [ticker] + [t for t, _ in otras]
+        datos = obtener_precios(lista, hora_nota=hora_nota)
+        precios = [linea_precio(t, datos[t]) for t in lista if t in datos]
+    return webull, otras, precios
+
+
+def _id_mensaje(resultado):
+    return resultado if isinstance(resultado, int) and not isinstance(resultado, bool) else None
+
+
+def tramitar_8k(ctx, e, nombre, ticker, motivos, acc):
+    """Aviso (o seguimiento) de un 8-K relevante. True si se envió."""
+    headers, estado = ctx["headers"], ctx["estado"]
+    link = e.get("link", "")
+    ahora_iso = datetime.now(timezone.utc).isoformat()
+    estado["recientes"][ticker] = {"hora": ahora_iso, "items": motivos, "link": link}
+
+    noticia = None
+    if BUSCAR_NOTICIAS:
+        try:
+            noticia = buscar_noticia(ticker, nombre, fecha_de(e), resultados=("2.02" in motivos))
+        except Exception as ex:  # la búsqueda nunca debe impedir el aviso
+            print(f"  búsqueda de noticia fallida: {ex}")
+        print(f"  noticia relacionada: {noticia['link'] if noticia else 'ninguna'}")
+
+    # ¿Ya se avisó de esta noticia con la nota de prensa? Entonces solo se responde a ese aviso.
+    previo = estado["avisos"].get(ticker)
+    mismo_suceso = bool(
+        previo and previo.get("tipo") == "nota" and not previo.get("acc")
+        and _reciente(previo["hora"], 24)
+        and not (noticia and previo.get("link") and noticia["link"] != previo["link"])
+    )
+    if mismo_suceso:
+        extractos = {}
+        if INCLUIR_EXTRACTO:
+            extractos, _ = construir_extractos(e, motivos[:3], headers, {ticker})
+        mensaje = armar_seguimiento_8k(ticker, nombre, motivos, extractos, link)
+        if enviar_telegram(mensaje, responder_a=previo.get("msg")):
+            previo["acc"] = acc
+            print(f"  seguimiento del 8-K enviado como respuesta al aviso de la nota ({ticker})")
+            return True
+        return False
+
+    # Sin resumen de la noticia, se usa el extracto del propio filing
+    extractos, mencionados = {}, {}
+    if noticia:
+        mencionados.update(noticia.get("tickers", {}))
+    if INCLUIR_EXTRACTO and not (noticia and noticia["resumen"]):
+        extractos, del_filing = construir_extractos(e, motivos[:3], headers, {ticker})
+        for t, b in del_filing.items():
+            mencionados.setdefault(t, b)
+
+    webull, otras, precios = extras_aviso(ctx, ticker, mencionados, (noticia or {}).get("fecha"))
+    etiqueta = ("🏷 Nota de prensa + 8-K" if noticia
+                else "🏷 Solo 8-K (no encuentro nota de prensa)")
+    mensaje = armar_mensaje(ticker, nombre, motivos, extractos, link, noticia, webull,
+                            otras, precios, etiqueta)
+    if len(mensaje) > 4000:  # límite de Telegram: 4096
+        mensaje = armar_mensaje(ticker, nombre, motivos, {}, link, noticia, webull,
+                                otras, precios, etiqueta)
+    resultado = enviar_telegram(mensaje)
+    if not resultado:
+        return False
+    estado["avisos"][ticker] = {
+        "msg": _id_mensaje(resultado), "hora": ahora_iso, "tipo": "8k", "acc": acc,
+        "cat": "", "link": noticia["link"] if noticia else None,
+    }
+    if noticia:  # esta nota ya está avisada: que no salte de nuevo por la vía de las notas
+        estado["notas"].append(noticia["link"])
+    return True
+
+
+def procesar_nota(ctx, fuente, en, claves_nombre):
+    """Decide si una nota de prensa merece aviso. Devuelve su resultado como texto."""
+    estado = ctx["estado"]
+    titular = " ".join(en.get("title", "").split())
+    link = en.get("link", "")
+    resumen_rss = quitar_html(en.get("summary", ""))
+
+    con_patron, por_nombre = vigilados_en_nota(en, ctx["vigilados"], claves_nombre)
+    if not con_patron and not por_nombre:
+        return "ajena"
+    categoria = categoria_nota(titular)
+    if not categoria:
+        print(f"  nota sin categoría relevante ({', '.join(list(con_patron) + por_nombre)}): {titular[:90]}")
+        return "no_relevante"
+    if ABOGADOS_RE.search(titular + " " + resumen_rss):
+        return "ruido"
+
+    texto = ""
+    try:
+        texto = descargar_texto(link, {"User-Agent": NOTICIAS_UA})
+    except Exception as ex:
+        print(f"  no se pudo abrir la nota {link}: {ex}")
+    elegidos = dict(con_patron)
+    for t in por_nombre:  # coincidencia solo por nombre: se confirma con "(Nasdaq: X)" en la nota
+        if texto and re.search(rf"(?:NYSE|NASDAQ|CBOE)[^):]{{0,20}}:\s*{re.escape(t)}\b", texto, re.I):
+            elegidos.setdefault(t, "")
+    if not elegidos:
+        return "ajena"
+    ticker = next(iter(elegidos))
+
+    arranque = (resumen_desde_dateline(texto, 700) or texto[:700]) if texto else ""
+    if ABOGADOS_RE.search(arranque):
+        return "ruido"
+
+    previo = estado["avisos"].get(ticker)
+    if previo and (previo.get("link") == link or (
+            previo.get("tipo") == "nota" and previo.get("cat") == categoria
+            and _reciente(previo["hora"], 3))):
+        return "duplicada"
+
+    resumen = ""
+    if texto:
+        if categoria == "Resultados financieros":
+            resumen = puntos_clave_resultados(texto)
+        resumen = resumen or resumen_desde_dateline(texto, EXTRACTO_MAX)
+    resumen = resumen or recortar(resumen_rss, EXTRACTO_MAX)
+    mencionados = tickers_mencionados(texto, {ticker}) if texto else {}
+
+    hora_nota = None
+    if en.get("published_parsed"):
+        hora_nota = datetime(*en["published_parsed"][:6], tzinfo=timezone.utc)
+    webull, otras, precios = extras_aviso(ctx, ticker, mencionados, hora_nota)
+
+    reciente_8k = estado["recientes"].get(ticker)
+    tiene_8k = bool(reciente_8k and _reciente(reciente_8k["hora"], 24))
+    etiqueta = ("🏷 Nota de prensa + 8-K" if tiene_8k
+                else "🏷 Solo nota de prensa (8-K aún no publicado)")
+    nombre = NOMBRES_SEC.get(ticker, ticker)
+    link_8k = reciente_8k["link"] if tiene_8k else None
+    mensaje = armar_mensaje_nota(ticker, nombre, categoria, etiqueta, resumen, link, fuente,
+                                 link_8k, webull, otras, precios)
+    if len(mensaje) > 4000:
+        mensaje = armar_mensaje_nota(ticker, nombre, categoria, etiqueta, recortar(resumen, 300),
+                                     link, fuente, link_8k, webull, otras, precios)
+    resultado = enviar_telegram(mensaje)
+    if not resultado:
+        return "fallo"
+    estado["avisos"][ticker] = {
+        "msg": _id_mensaje(resultado), "hora": datetime.now(timezone.utc).isoformat(),
+        "tipo": "nota", "acc": "previo" if tiene_8k else None, "cat": categoria, "link": link,
+    }
+    return "enviada"
+
+
+def revisar_notas(ctx, primera_vez):
+    """Lee los feeds de notas de prensa y avisa de las que afectan a tu lista."""
+    estado = ctx["estado"]
+    claves_nombre = {}
+    for t in ctx["vigilados"]:
+        clave = nombre_para_buscar(NOMBRES_SEC.get(t, "")).lower()
+        if len(clave) >= 4:
+            claves_nombre[t] = clave
+
+    vistas = set(estado["notas"])
+    cuentas = {"leidas": 0, "nuevas": 0}
+    por_procesar = []
+    for fuente, url in FEEDS_NOTAS + cargar_feeds_extra():
+        try:
+            r = get_con_reintentos(url, {"User-Agent": NOTICIAS_UA}, intentos=2,
+                                   timeout=(10, 20), exit_en_403=False)
+            entradas = feedparser.parse(r.content).entries
+        except Exception as ex:
+            print(f"  notas {fuente}: no disponible ({ex})")
+            continue
+        print(f"  notas {fuente}: {len(entradas)} entradas")
+        cuentas["leidas"] += len(entradas)
+        for en in entradas:
+            link = en.get("link", "")
+            if not link or link in vistas:
+                continue
+            vistas.add(link)
+            estado["notas"].append(link)
+            cuentas["nuevas"] += 1
+            if not primera_vez:
+                por_procesar.append((fuente, en))
+
+    if primera_vez:
+        print(f"Notas: primera lectura, {cuentas['nuevas']} memorizadas sin avisar.")
+        return
+    for fuente, en in reversed(por_procesar):  # de la más antigua a la más reciente
+        try:
+            resultado = procesar_nota(ctx, fuente, en, claves_nombre)
+        except Exception as ex:  # una nota rara no debe romper el resto
+            print(f"  error procesando una nota: {ex}")
+            resultado = "error"
+        cuentas[resultado] = cuentas.get(resultado, 0) + 1
+        if resultado == "fallo":  # no se pudo enviar: se reintenta en la próxima ejecución
+            estado["notas"].remove(en.get("link", ""))
+    detalle = " · ".join(f"{k} {v}" for k, v in cuentas.items() if k not in ("leidas", "nuevas"))
+    print(f"Notas: {cuentas['leidas']} leídas · {cuentas['nuevas']} nuevas"
+          + (f" · {detalle}" if detalle else ""))
 
 
 def id_filing(entrada):
@@ -755,15 +1104,25 @@ def main():
           f"{len(vigilados) - len(sin_cik)} encontrados en el SEC."
           + (f" Sin datos: {', '.join(sin_cik[:15])}" if sin_cik else ""))
 
-    vistos = cargar_vistos()
-    primera_vez = vistos is None
-    vistos = vistos or []
+    estado = cargar_estado()
+    primera_vez = estado is None
+    estado = estado or {}
+    primera_vez_notas = "notas" not in estado  # también al actualizar desde una versión antigua
+    estado.setdefault("filings", [])
+    estado.setdefault("notas", [])
+    estado.setdefault("avisos", {})
+    estado.setdefault("recientes", {})
+    vistos = estado["filings"]
     vistos_set = set(vistos)
+    ctx = {"headers": headers, "bolsas": None, "estado": estado, "vigilados": vigilados}
     enviadas = nuevos = sin_formato = del_sp500 = a_avisar = 0
-    bolsas = None
     otros = []
 
-    entradas = descargar_entradas(headers, vistos_set, primera_vez)
+    try:
+        entradas = descargar_entradas(headers, vistos_set, primera_vez)
+    except FeedNoDisponible as e:
+        print(f"Aviso: el SEC no responde ({e}). Se reintentará en la próxima ejecución.")
+        entradas = []
     print(f"Filings leídos del feed: {len(entradas)}.")
 
     # De la más antigua a la más reciente, para que lleguen en orden
@@ -799,58 +1158,17 @@ def main():
         a_avisar += 1
         motivos = relevantes if ITEMS_RELEVANTES else sorted(items)
 
-        ticker = candidatos[0]
-        link = e.get("link", "")
-
-        noticia = None
-        if BUSCAR_NOTICIAS:
-            try:
-                noticia = buscar_noticia(ticker, m["name"], fecha_de(e), resultados=("2.02" in motivos))
-            except Exception as ex:  # la búsqueda nunca debe impedir el aviso
-                print(f"  búsqueda de noticia fallida: {ex}")
-            print(f"  noticia relacionada: {noticia['link'] if noticia else 'ninguna'}")
-
-        # Sin resumen de la noticia, se usa el extracto del propio filing
-        extractos, mencionados = {}, {}
-        if noticia:
-            mencionados.update(noticia.get("tickers", {}))
-        if INCLUIR_EXTRACTO and not (noticia and noticia["resumen"]):
-            extractos, del_filing = construir_extractos(e, motivos[:3], headers, {ticker})
-            for t, b in del_filing.items():
-                mencionados.setdefault(t, b)
-
-        if (ENLACE_WEBULL or mencionados) and bolsas is None:
-            bolsas = cargar_bolsas(headers)
-        webull = enlace_webull(ticker, bolsas) if (ENLACE_WEBULL and bolsas) else None
-
-        enlaces_otras = []
-        for t, bolsa_texto in list(mencionados.items())[:4]:
-            url = enlace_webull(t, bolsas or {}) if ENLACE_WEBULL else None
-            if not url and ENLACE_WEBULL and bolsa_texto in ("nasdaq", "nyse"):
-                url = f"https://www.webull.com/quote/{bolsa_texto}-{t.lower()}"
-            enlaces_otras.append((t, url))
-        if enlaces_otras:
-            print("  también menciona: " + ", ".join(t for t, _ in enlaces_otras))
-
-        precios = []
-        if USAR_ALPACA:
-            lista = [ticker] + [t for t, _ in enlaces_otras]
-            datos = obtener_precios(lista, hora_nota=(noticia or {}).get("fecha"))
-            precios = [linea_precio(t, datos[t]) for t in lista if t in datos]
-
-        mensaje = armar_mensaje(ticker, m["name"], motivos, extractos, link, noticia, webull,
-                                enlaces_otras, precios)
-        if len(mensaje) > 4000:  # límite de Telegram: 4096
-            mensaje = armar_mensaje(ticker, m["name"], motivos, {}, link, noticia, webull,
-                                    enlaces_otras, precios)
-        if enviar_telegram(mensaje):
+        if tramitar_8k(ctx, e, m["name"], candidatos[0], motivos, acc):
             enviadas += 1
         else:
             # Fallo de envío: se desmarca para reintentarlo en la próxima ejecución
             vistos.remove(acc)
             vistos_set.discard(acc)
 
-    guardar_vistos(vistos)
+    if AVISAR_CON_NOTA:
+        revisar_notas(ctx, primera_vez_notas)
+
+    guardar_estado(estado)
 
     if primera_vez:
         print(f"Primera ejecución: {len(vistos)} filings memorizados, sin enviar nada.")
